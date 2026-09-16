@@ -1,0 +1,171 @@
+name: 'Velxio CI'
+description: 'Run your firmware in the Velxio simulator from GitHub Actions: serial checks, automation scenarios, screenshots.'
+author: 'Velxio'
+branding:
+  icon: 'cpu'
+  color: 'blue'
+
+# Inputs mirror what an embedded-CI job already expresses (a token, a
+# project directory, a timeout, text to expect or reject, a scenario, a
+# serial log) so a job migrating from another simulator changes the `uses:`
+# line and the secret name, nothing else. Everything maps 1:1 onto a
+# velxio-cli flag; see https://github.com/velxio/velxio-cli.
+inputs:
+  token:
+    description: 'Velxio CI token (create one at https://velxio.dev/account/ci). Store it as a repository secret.'
+    required: true
+  path:
+    description: 'Project directory holding velxio.toml (or wokwi.toml) and diagram.json.'
+    required: false
+    default: '.'
+  timeout:
+    description: 'Simulated-time budget in milliseconds.'
+    required: false
+    default: '10000'
+  expect_text:
+    description: 'The run passes as soon as this text appears on the serial port.'
+    required: false
+  fail_text:
+    description: 'The run fails as soon as this text appears on the serial port.'
+    required: false
+  scenario:
+    description: 'Automation scenario YAML, relative to path.'
+    required: false
+  serial_log_file:
+    description: 'Write every serial byte of the run to this file, relative to path.'
+    required: false
+  diagram_file:
+    description: 'Circuit file, relative to path (default diagram.json).'
+    required: false
+  elf:
+    description: 'ELF firmware, relative to path (overrides the toml).'
+    required: false
+  firmware:
+    description: 'Firmware file (.hex, .bin, .uf2, merged ESP32 image), relative to path (overrides the toml).'
+    required: false
+  screenshot_part:
+    description: 'Part id to screenshot.'
+    required: false
+  screenshot_time:
+    description: 'Simulated time in milliseconds at which to take the screenshot.'
+    required: false
+  screenshot_file:
+    description: 'Screenshot output file, relative to path (default screenshot.png).'
+    required: false
+  timeout_exit_code:
+    description: 'Process exit code when the simulated-time budget is reached (default 42; use 0 to run for N ms and collect serial).'
+    required: false
+  server:
+    description: 'Velxio server URL.'
+    required: false
+    default: 'https://velxio.dev'
+  cli_version:
+    description: 'velxio-cli release to install (a tag like v1.2.0, or latest).'
+    required: false
+    default: 'latest'
+
+outputs:
+  run_id:
+    description: 'Server-side run id.'
+    value: ${{ steps.run.outputs.run_id }}
+  run_url:
+    description: 'URL of the run in the Velxio account page.'
+    value: ${{ steps.run.outputs.run_url }}
+  status:
+    description: 'passed | failed | timeout | error | cancelled | lost'
+    value: ${{ steps.run.outputs.status }}
+  sim_time_ms:
+    description: 'Simulated milliseconds the run lasted.'
+    value: ${{ steps.run.outputs.sim_time_ms }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Resolve velxio-cli release
+      id: resolve
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "${{ runner.os }}-${{ runner.arch }}" in
+          Linux-X64)     label=Linux_64bit ;;
+          Linux-ARM64)   label=Linux_ARM64 ;;
+          macOS-X64)     label=macOS_64bit ;;
+          macOS-ARM64)   label=macOS_ARM64 ;;
+          Windows-X64)   label=Windows_64bit ;;
+          *) echo "::error::unsupported runner ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+        esac
+        version='${{ inputs.cli_version }}'
+        if [ "$version" = "latest" ]; then
+          # Resolve the tag so the cache key is stable and the SHA256SUMS
+          # we verify belongs to the same release as the zip.
+          version=$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+            https://api.github.com/repos/velxio/velxio-cli/releases/latest | \
+            sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+        fi
+        [ -n "$version" ] || { echo "::error::could not resolve the velxio-cli release"; exit 1; }
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "label=$label" >> "$GITHUB_OUTPUT"
+        echo "dir=$RUNNER_TOOL_CACHE/velxio-cli/$version/$label" >> "$GITHUB_OUTPUT"
+
+    - name: Cache velxio-cli
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.resolve.outputs.dir }}
+        key: velxio-cli-${{ steps.resolve.outputs.version }}-${{ steps.resolve.outputs.label }}
+
+    - name: Install velxio-cli
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        version='${{ steps.resolve.outputs.version }}'
+        label='${{ steps.resolve.outputs.label }}'
+        dir='${{ steps.resolve.outputs.dir }}'
+        base="https://github.com/velxio/velxio-cli/releases/download/$version"
+        asset="velxio-cli_${version}_${label}.zip"
+        tmp=$(mktemp -d)
+        curl -fsSL -o "$tmp/$asset" "$base/$asset"
+        curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
+        (cd "$tmp" && grep " $asset\$" SHA256SUMS | (sha256sum -c - 2>/dev/null || shasum -a 256 -c -))
+        mkdir -p "$dir"
+        unzip -q -o "$tmp/$asset" -d "$dir"
+        chmod +x "$dir"/velxio-cli* || true
+
+    - name: Add velxio-cli to PATH
+      shell: bash
+      run: echo '${{ steps.resolve.outputs.dir }}' >> "$GITHUB_PATH"
+
+    - name: Run the simulation
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.path }}
+      env:
+        VELXIO_CLI_TOKEN: ${{ inputs.token }}
+        VELXIO_CLI_SERVER: ${{ inputs.server }}
+        VELXIO_CLI_SUMMARY_FILE: ${{ runner.temp }}/velxio-ci-summary.json
+      run: |
+        set -uo pipefail
+        args=(--timeout '${{ inputs.timeout }}')
+        [ -n '${{ inputs.expect_text }}' ]       && args+=(--expect-text '${{ inputs.expect_text }}')
+        [ -n '${{ inputs.fail_text }}' ]         && args+=(--fail-text '${{ inputs.fail_text }}')
+        [ -n '${{ inputs.scenario }}' ]          && args+=(--scenario '${{ inputs.scenario }}')
+        [ -n '${{ inputs.serial_log_file }}' ]   && args+=(--serial-log-file '${{ inputs.serial_log_file }}')
+        [ -n '${{ inputs.diagram_file }}' ]      && args+=(--diagram-file '${{ inputs.diagram_file }}')
+        [ -n '${{ inputs.elf }}' ]               && args+=(--elf '${{ inputs.elf }}')
+        [ -n '${{ inputs.firmware }}' ]          && args+=(--firmware '${{ inputs.firmware }}')
+        [ -n '${{ inputs.screenshot_part }}' ]   && args+=(--screenshot-part '${{ inputs.screenshot_part }}')
+        [ -n '${{ inputs.screenshot_time }}' ]   && args+=(--screenshot-time '${{ inputs.screenshot_time }}')
+        [ -n '${{ inputs.screenshot_file }}' ]   && args+=(--screenshot-file '${{ inputs.screenshot_file }}')
+        [ -n '${{ inputs.timeout_exit_code }}' ] && args+=(--timeout-exit-code '${{ inputs.timeout_exit_code }}')
+        velxio-cli "${args[@]}" .
+        code=$?
+        # The CLI writes a one-object summary when VELXIO_CLI_SUMMARY_FILE is
+        # set; surface it as step outputs so a later step can link the run.
+        if [ -f "$VELXIO_CLI_SUMMARY_FILE" ]; then
+          for key in run_id run_url status sim_time_ms; do
+            val=$(sed -n "s/.*\"$key\": *\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$VELXIO_CLI_SUMMARY_FILE" | head -n1)
+            echo "$key=$val" >> "$GITHUB_OUTPUT"
+          done
+        fi
+        exit $code
