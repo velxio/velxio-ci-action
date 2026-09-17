@@ -123,14 +123,15 @@ runs:
         label='${{ steps.resolve.outputs.label }}'
         dir='${{ steps.resolve.outputs.dir }}'
         base="https://github.com/velxio/velxio-cli/releases/download/$version"
-        asset="velxio-cli_${version}_${label}.zip"
+        # The bare binary, not the zip: a container job often has curl and no
+        # unzip, and this skips a step on every other runner too.
+        case "$label" in Windows_*) asset="velxio-cli_${version}_${label}.exe" ;; *) asset="velxio-cli_${version}_${label}" ;; esac
         tmp=$(mktemp -d)
         curl -fsSL -o "$tmp/$asset" "$base/$asset"
         curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
         (cd "$tmp" && grep " $asset\$" SHA256SUMS | (sha256sum -c - 2>/dev/null || shasum -a 256 -c -))
         mkdir -p "$dir"
-        unzip -q -o "$tmp/$asset" -d "$dir"
-        chmod +x "$dir"/velxio-cli* || true
+        case "$label" in Windows_*) cp "$tmp/$asset" "$dir/velxio-cli.exe" ;; *) install -m 0755 "$tmp/$asset" "$dir/velxio-cli" ;; esac
 
     - name: Add velxio-cli to PATH
       shell: bash
