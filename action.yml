@@ -159,8 +159,11 @@ runs:
         [ -n '${{ inputs.screenshot_time }}' ]   && args+=(--screenshot-time '${{ inputs.screenshot_time }}')
         [ -n '${{ inputs.screenshot_file }}' ]   && args+=(--screenshot-file '${{ inputs.screenshot_file }}')
         [ -n '${{ inputs.timeout_exit_code }}' ] && args+=(--timeout-exit-code '${{ inputs.timeout_exit_code }}')
-        velxio-cli "${args[@]}" .
-        code=$?
+        # GitHub runs `shell: bash` as `bash -e`, so a failing run would end the
+        # step on this line and skip the outputs below, the case a later step
+        # most needs them for. Capture the code instead of letting -e fire.
+        code=0
+        velxio-cli "${args[@]}" . || code=$?
         # The CLI writes a one-object summary when VELXIO_CLI_SUMMARY_FILE is
         # set; surface it as step outputs so a later step can link the run.
         if [ -f "$VELXIO_CLI_SUMMARY_FILE" ]; then
